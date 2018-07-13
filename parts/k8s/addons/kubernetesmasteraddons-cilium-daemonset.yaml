@@ -1,5 +1,5 @@
-kind: ConfigMap
 apiVersion: v1
+kind: ConfigMap
 metadata:
   name: cilium-config
   namespace: kube-system
@@ -7,9 +7,7 @@ metadata:
     addonmanager.kubernetes.io/mode: "EnsureExists"
 data:
   # This etcd-config contains the etcd endpoints of your cluster. If you use
-  # TLS please make sure you uncomment the ca-file line and add the respective
-  # certificate has a k8s secret, see explanation below in the comment labeled
-  # "ETCD-CERT"
+  # TLS please make sure you follow the tutorial in https://cilium.link/etcd-config
   etcd-config: |-
     ---
     endpoints:
@@ -27,6 +25,9 @@ data:
   # If you want to run cilium in debug mode change this value to true
   debug: "false"
   disable-ipv4: "false"
+  # If you want to clean cilium state; change this value to true
+  clean-cilium-state: "false"
+  legacy-host-allows-world: "false"
 ---
 # The etcd secrets can be populated in kubernetes.
 # For more information see: https://kubernetes.io/docs/concepts/configuration/secret
@@ -46,33 +47,16 @@ data:
   etcd-client-key: "<ETCD_CLIENT_KEY>"
   etcd-client-crt: "<ETCD_CLIENT_CERT>"
 ---
-apiVersion: v1
 kind: ServiceAccount
+apiVersion: v1
 metadata:
   name: cilium
   namespace: kube-system
   labels:
     addonmanager.kubernetes.io/mode: "EnsureExists"
 ---
-kind: ClusterRoleBinding
-apiVersion: rbac.authorization.k8s.io/v1beta1
-metadata:
-  name: cilium
-  labels:
-    addonmanager.kubernetes.io/mode: "EnsureExists"
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: cilium
-subjects:
-- kind: ServiceAccount
-  name: cilium
-  namespace: kube-system
-- kind: Group
-  name: system:nodes
----
-apiVersion: extensions/v1beta1
 kind: DaemonSet
+apiVersion: apps/v1
 metadata:
   name: cilium
   namespace: kube-system
@@ -86,6 +70,10 @@ spec:
       # The current default value is 1 or 100% for daemonsets; Adding an explicit value here
       # to avoid confusion, as the default value is specific to the type (daemonset/deployment).
       maxUnavailable: "100%"
+  selector:
+    matchLabels:
+      k8s-app: cilium
+      kubernetes.io/cluster-service: "true"
   template:
     metadata:
       labels:
@@ -97,31 +85,42 @@ spec:
         # gets priority scheduling.
         # https://kubernetes.io/docs/tasks/administer-cluster/guaranteed-scheduling-critical-addon-pods/
         scheduler.alpha.kubernetes.io/critical-pod: ''
+        scheduler.alpha.kubernetes.io/tolerations: >-
+          [{"key":"dedicated","operator":"Equal","value":"master","effect":"NoSchedule"}]
         prometheus.io/scrape: "true"
         prometheus.io/port: "9090"
     spec:
       serviceAccountName: cilium
-      tolerations:
-        - key: node-role.kubernetes.io/master
-          operator: Equal
-          value: "true"
-          effect: NoSchedule
-        - key: CriticalAddonsOnly
-          operator: Exists
+      initContainers:
+      - name: clean-cilium-state
+        image: docker.io/library/busybox:1.28.4
+        imagePullPolicy: IfNotPresent
+        command: ['sh', '-c', 'if [ "${CLEAN_CILIUM_STATE}" = "true" ]; then rm -rf /var/run/cilium/state; rm -rf /sys/fs/bpf/tc/globals/cilium_*; fi']
+        volumeMounts:
+          - name: bpf-maps
+            mountPath: /sys/fs/bpf
+          - name: cilium-run
+            mountPath: /var/run/cilium
+        env:
+          - name: "CLEAN_CILIUM_STATE"
+            valueFrom:
+              configMapKeyRef:
+                name: cilium-config
+                optional: true
+                key: clean-cilium-state
       containers:
-      - image: cilium/cilium:stable
+      - image: docker.io/cilium/cilium:v1.1.0
         imagePullPolicy: Always
         name: cilium-agent
         command: [ "cilium-agent" ]
         args:
           - "--debug=$(CILIUM_DEBUG)"
-          - "-t"
-          - "vxlan"
-          - "--kvstore"
-          - "etcd"
-          - "--kvstore-opt"
-          - "etcd.config=/var/lib/etcd-config/etcd.config"
+          - "-t=vxlan"
+          - "--kvstore=etcd"
+          - "--kvstore-opt=etcd.config=/var/lib/etcd-config/etcd.config"
           - "--disable-ipv4=$(DISABLE_IPV4)"
+          - --container-runtime-endpoint=containerd=/run/containerd/containerd.sock
+          - --container-runtime-endpoint=docker=unix:///var/run/docker.sock
         ports:
           - name: prometheus
             containerPort: 9090
@@ -157,6 +156,12 @@ spec:
                 name: cilium-metrics-config
                 optional: true
                 key: prometheus-serve-addr
+          - name: "CILIUM_LEGACY_HOST_ALLOWS_WORLD"
+            valueFrom:
+              configMapKeyRef:
+                name: cilium-config
+                optional: true
+                key: legacy-host-allows-world
         livenessProbe:
           exec:
             command:
@@ -187,6 +192,9 @@ spec:
           - name: docker-socket
             mountPath: /var/run/docker.sock
             readOnly: true
+          - name: containerd-socket
+            mountPath: /run/containerd/containerd.sock
+            readOnly: true
           - name: etcd-config-path
             mountPath: /var/lib/etcd-config
             readOnly: true
@@ -212,6 +220,10 @@ spec:
         - name: docker-socket
           hostPath:
             path: /var/run/docker.sock
+          # Containerd
+        - name: containerd-socket
+          hostPath:
+            path: /run/containerd/containerd.sock
           # To install cilium cni plugin in the host
         - name: cni-path
           hostPath:
@@ -231,12 +243,41 @@ spec:
         - name: etcd-secrets
           secret:
             secretName: cilium-etcd-secrets
+            optional: true
+      restartPolicy: Always
+      tolerations:
+      - effect: NoSchedule
+        operator: Equal
+        value: "true"
+        key: node-role.kubernetes.io/master
+      - effect: NoSchedule
+        key: node.cloudprovider.kubernetes.io/uninitialized
+        value: "true"
+      # Mark cilium's pod as critical for rescheduling
+      - key: CriticalAddonsOnly
+        operator: "Exists"
 ---
-kind: ClusterRole
-apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
 metadata:
   name: cilium
+  labels:
+    addonmanager.kubernetes.io/mode: "EnsureExists"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cilium
+subjects:
+- kind: ServiceAccount
+  name: cilium
   namespace: kube-system
+- kind: Group
+  name: system:nodes
+---
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: cilium
   labels:
     addonmanager.kubernetes.io/mode: "EnsureExists"
 rules:
